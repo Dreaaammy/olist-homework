@@ -1,4 +1,4 @@
-"""Проверки CSV и временного разбиения без PostgreSQL и MLflow."""
+"""Проверки данных без PostgreSQL и сервера MLflow."""
 
 import hashlib
 import os
@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from olist_pipeline import NUMERIC_COLUMNS, REQUIRED_COLUMNS, prepare, validate
+from olist_pipeline import NUMERIC_COLUMNS, REQUIRED_COLUMNS, prepare, train, validate
 
 
 class PipelineTests(unittest.TestCase):
@@ -130,6 +130,26 @@ class PipelineTests(unittest.TestCase):
         finally:
             active = False
 
+    def test_validate_read_only_file_and_directory(self):
+        before = self.snapshot.read_bytes()
+        self.snapshot.chmod(0o400)
+        self.snapshot.parent.chmod(0o500)
+        try:
+            self.assertEqual(validate(self.snapshot), str(self.snapshot))
+            self.assertEqual(self.snapshot.read_bytes(), before)
+        finally:
+            self.snapshot.parent.chmod(0o700)
+            self.snapshot.chmod(0o600)
+
+    def test_validate_reordered_columns_and_quoted_text(self):
+        frame = self.frame.copy()
+        frame.loc[0, "category"] = 'café, книги\n"новинки"'
+        frame["extra_column"] = "ignored"
+        frame[frame.columns[::-1]].to_csv(self.snapshot, index=False, encoding="utf-8")
+        before = self.snapshot.read_bytes()
+        self.assertEqual(validate(self.snapshot), str(self.snapshot))
+        self.assertEqual(self.snapshot.read_bytes(), before)
+
     def test_prepare_boundary_hash_and_repeat(self):
         before = self.snapshot.read_bytes()
         with patch.dict(os.environ, {"OLIST_CUTOFF": "2017-07-31"}):
@@ -158,6 +178,29 @@ class PipelineTests(unittest.TestCase):
         with patch.dict(os.environ, {"OLIST_CUTOFF": "2017-07-31"}):
             with self.assertRaisesRegex(ValueError, "both classes"):
                 prepare(self.snapshot)
+
+    def test_train_rejects_changed_snapshot_before_mlflow(self):
+        with patch.dict(os.environ, {"OLIST_CUTOFF": "2017-07-31"}):
+            prepared = prepare(self.snapshot)
+        # Данные те же, но байты снимка изменились: хеш должен это заметить.
+        with self.snapshot.open("a", encoding="utf-8") as file:
+            file.write("\n")
+        with patch("mlflow.set_experiment") as experiment, patch("mlflow.start_run") as run:
+            with self.assertRaisesRegex(ValueError, "снимок изменился"):
+                train(prepared, dag_run_id="test_changed_snapshot")
+            experiment.assert_not_called()
+            run.assert_not_called()
+
+    def test_train_rejects_inconsistent_split_counts(self):
+        with patch.dict(os.environ, {"OLIST_CUTOFF": "2017-07-31"}):
+            prepared = prepare(self.snapshot)
+        train_path = Path(prepared["train_path"])
+        pd.read_csv(train_path).iloc[:1].to_csv(train_path, index=False)
+        with patch("mlflow.set_experiment") as experiment, patch("mlflow.start_run") as run:
+            with self.assertRaisesRegex(ValueError, "Размеры выборок"):
+                train(prepared, dag_run_id="test_changed_split")
+            experiment.assert_not_called()
+            run.assert_not_called()
 
 
 if __name__ == "__main__":
